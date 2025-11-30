@@ -3,7 +3,7 @@ const dotenv = require('dotenv');
 const OpenAI = require('openai');
 const cors = require('cors');
 const connectToDatabase = require('./db');
-const Conflict = require('./models/Conflict');
+const Conflict = require('./models/conflict');
 
 dotenv.config();
 
