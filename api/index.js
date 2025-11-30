@@ -13,14 +13,13 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize OpenAI
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 // 1. Health Check Route
 app.get('/', (req, res) => {
   res.send('Conflict Resolver API is running!');
+});
+
+app.get('/api', (req, res) => {
+  res.json({ status: 'ok', message: 'Conflict Resolver API' });
 });
 
 // 2. The Resolution Route
@@ -32,12 +31,27 @@ app.post('/api/resolve', async (req, res) => {
       return res.status(400).json({ error: 'Message is required' });
     }
 
+    // Validate environment variables
+    if (!process.env.OPENAI_API_KEY) {
+      console.error('Missing OPENAI_API_KEY');
+      return res.status(500).json({ error: 'Server configuration error: Missing OpenAI API key' });
+    }
+    if (!process.env.MONGO_URI) {
+      console.error('Missing MONGO_URI');
+      return res.status(500).json({ error: 'Server configuration error: Missing MongoDB URI' });
+    }
+
+    // Initialize OpenAI client per request (safer for serverless)
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+
     // Connect to DB
     await connectToDatabase();
 
     // Call OpenAI
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini", // Cost-effective and fast
+      model: "gpt-4o-mini",
       messages: [
         { 
           role: "system", 
@@ -62,21 +76,16 @@ app.post('/api/resolve', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error('Error in /api/resolve:', error.message);
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: error.message 
+    });
   }
 });
 
-// Validate environment variables at startup
-if (!process.env.OPENAI_API_KEY) {
-  console.error('FATAL: Missing OPENAI_API_KEY environment variable');
-}
-if (!process.env.MONGO_URI) {
-  console.error('FATAL: Missing MONGO_URI environment variable');
-}
-
 // For local development only
-if (process.env.NODE_ENV !== 'production') {
+if (require.main === module) {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
     console.log(`Server running locally on port ${PORT}`);
