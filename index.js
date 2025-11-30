@@ -22,6 +22,31 @@ app.get('/api', (req, res) => {
   res.json({ status: 'ok', message: 'Conflict Resolver API' });
 });
 
+// Health Check with Database Status
+app.get('/health', async (req, res) => {
+  const healthCheck = {
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+    status: 'OK',
+    environment: {
+      nodeEnv: process.env.NODE_ENV || 'development',
+      hasOpenAIKey: !!process.env.OPENAI_API_KEY,
+      hasMongoURI: !!process.env.MONGO_URI
+    }
+  };
+
+  try {
+    // Check database connection
+    await connectToDatabase();
+    healthCheck.database = 'connected';
+    res.status(200).json(healthCheck);
+  } catch (error) {
+    healthCheck.database = 'disconnected';
+    healthCheck.error = error.message;
+    res.status(503).json(healthCheck);
+  }
+});
+
 // 2. The Resolution Route
 app.post('/api/resolve', async (req, res) => {
   try {
