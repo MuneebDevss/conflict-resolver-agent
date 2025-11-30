@@ -67,7 +67,15 @@ app.post('/api/resolve', async (req, res) => {
   }
 });
 
-// Add this to the very bottom of api/index.js
+// Validate environment variables at startup
+if (!process.env.OPENAI_API_KEY) {
+  console.error('FATAL: Missing OPENAI_API_KEY environment variable');
+}
+if (!process.env.MONGO_URI) {
+  console.error('FATAL: Missing MONGO_URI environment variable');
+}
+
+// For local development only
 if (process.env.NODE_ENV !== 'production') {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
@@ -75,16 +83,5 @@ if (process.env.NODE_ENV !== 'production') {
   });
 }
 
-// Export a serverless-compatible handler for Vercel
-module.exports = (req, res) => {
-  // Basic env validation to avoid silent crashes
-  if (!process.env.OPENAI_API_KEY) {
-    console.error('Missing OPENAI_API_KEY');
-    return res.status(500).json({ error: 'Server misconfiguration: OPENAI_API_KEY missing' });
-  }
-  if (!process.env.MONGO_URI) {
-    console.error('Missing MONGO_URI');
-    return res.status(500).json({ error: 'Server misconfiguration: MONGO_URI missing' });
-  }
-  return app(req, res);
-};
+// Export the Express app directly for Vercel
+module.exports = app;
