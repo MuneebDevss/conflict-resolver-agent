@@ -3,7 +3,7 @@ const dotenv = require('dotenv');
 const OpenAI = require('openai');
 const cors = require('cors');
 const connectToDatabase = require('./db');
-const Conflict = require('../models/Conflict');
+const Conflict = require('./models/Conflict');
 
 dotenv.config();
 
@@ -84,13 +84,10 @@ app.post('/api/resolve', async (req, res) => {
   }
 });
 
-// For local development only
-if (require.main === module) {
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
-    console.log(`Server running locally on port ${PORT}`);
-  });
-}
+// Start server (for Render and local development)
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
 
-// Export the Express app directly for Vercel
 module.exports = app;
