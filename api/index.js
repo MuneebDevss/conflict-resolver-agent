@@ -75,5 +75,16 @@ if (process.env.NODE_ENV !== 'production') {
   });
 }
 
-// Export the app for Vercel
-module.exports = app;
+// Export a serverless-compatible handler for Vercel
+module.exports = (req, res) => {
+  // Basic env validation to avoid silent crashes
+  if (!process.env.OPENAI_API_KEY) {
+    console.error('Missing OPENAI_API_KEY');
+    return res.status(500).json({ error: 'Server misconfiguration: OPENAI_API_KEY missing' });
+  }
+  if (!process.env.MONGO_URI) {
+    console.error('Missing MONGO_URI');
+    return res.status(500).json({ error: 'Server misconfiguration: MONGO_URI missing' });
+  }
+  return app(req, res);
+};
