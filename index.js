@@ -13,6 +13,57 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Store conversation histories (in production, use Redis or a database)
+const conversationHistories = new Map();
+
+// Helper function to manage conversation history
+const getConversationHistory = (sessionId) => {
+  if (!conversationHistories.has(sessionId)) {
+    conversationHistories.set(sessionId, []);
+  }
+  return conversationHistories.get(sessionId);
+};
+
+const addToHistory = (sessionId, userMessage, assistantMessage, toolCall = null, toolResult = null) => {
+  const history = getConversationHistory(sessionId);
+  
+  // Add user message
+  history.push({
+    role: 'user',
+    content: userMessage
+  });
+  
+  // Add assistant message with tool calls if present
+  if (toolCall && assistantMessage.tool_calls) {
+    history.push({
+      role: 'assistant',
+      content: assistantMessage.content || null,
+      tool_calls: assistantMessage.tool_calls
+    });
+    
+    // Add tool result
+    if (toolResult) {
+      history.push({
+        role: 'tool',
+        tool_call_id: toolCall.id,
+        content: JSON.stringify(toolResult)
+      });
+    }
+  } else {
+    // Regular assistant message without tools
+    history.push({
+      role: 'assistant',
+      content: assistantMessage.content
+    });
+  }
+  
+  // Keep only last 3 exchanges (limit to 9 messages to account for tool calls)
+  // Each exchange can be: user message + assistant message + optional tool message
+  if (history.length > 9) {
+    conversationHistories.set(sessionId, history.slice(-9));
+  }
+};
+
 // 1. Health Check Route
 app.get('/', (req, res) => {
   res.send('Calendar Manager API is running! 📅');
@@ -23,9 +74,10 @@ app.get('/api', (req, res) => {
     status: 'ok', 
     message: 'Calendar Manager AI Agent',
     version: '2.0.0',
-    description: 'Natural language calendar management with AI agent',
+    description: 'Natural language calendar management with AI agent and conversation context',
     endpoints: {
       agent: 'POST /api/agent (Main AI agent - accepts natural language queries)',
+      clearHistory: 'POST /api/agent/clear-history (Clear conversation history for a session)',
       health: 'GET /health',
       createMeeting: 'POST /api/meetings',
       getMeetings: 'GET /api/meetings',
@@ -34,9 +86,9 @@ app.get('/api', (req, res) => {
       deleteMeeting: 'DELETE /api/meetings/:id'
     },
     examples: [
-      'POST /api/agent with body: {"query": "Schedule a team meeting tomorrow at 2pm for 1 hour"}',
-      'POST /api/agent with body: {"query": "Show me all my meetings this week"}',
-      'POST /api/agent with body: {"query": "Cancel the meeting with ID 123abc"}'
+      'POST /api/agent with body: {"query": "Schedule a team meeting tomorrow at 2pm for 1 hour", "sessionId": "user123"}',
+      'POST /api/agent with body: {"query": "Show me all my meetings this week", "sessionId": "user123"}',
+      'POST /api/agent with body: {"query": "Move it to 3pm", "sessionId": "user123"} // Uses context from previous queries'
     ]
   });
 });
@@ -50,7 +102,8 @@ app.get('/health', async (req, res) => {
     environment: {
       nodeEnv: process.env.NODE_ENV || 'development',
       hasMongoURI: !!process.env.MONGO_URI
-    }
+    },
+    activeConversations: conversationHistories.size
   };
 
   try {
@@ -64,6 +117,22 @@ app.get('/health', async (req, res) => {
     healthCheck.error = error.message;
     res.status(503).json(healthCheck);
   }
+});
+
+// Clear conversation history
+app.post('/api/agent/clear-history', (req, res) => {
+  const { sessionId } = req.body;
+  
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required' });
+  }
+  
+  conversationHistories.delete(sessionId);
+  
+  res.status(200).json({
+    success: true,
+    message: 'Conversation history cleared'
+  });
 });
 
 // Helper function to check for time conflicts
@@ -89,11 +158,14 @@ const checkTimeConflict = async (startTime, endTime, excludeMeetingId = null) =>
 // AI Agent Endpoint - Main entry point for natural language queries
 app.post('/api/agent', async (req, res) => {
   try {
-    const { query } = req.body;
+    const { query, sessionId } = req.body;
 
     if (!query) {
       return res.status(400).json({ error: 'Query is required' });
     }
+
+    // Use sessionId or generate one if not provided
+    const session = sessionId || 'default';
 
     // Validate environment variables
     if (!process.env.OPENAI_API_KEY) {
@@ -138,6 +210,10 @@ app.post('/api/agent', async (req, res) => {
               endTime: {
                 type: "string",
                 description: "End time in ISO 8601 format (e.g., 2025-12-05T11:00:00Z)"
+              },
+              forceCreate: {
+                type: "boolean",
+                description: "Set to true to create meeting even if there's a conflict (only after user confirms)"
               }
             },
             required: ["title", "startTime", "endTime"]
@@ -220,13 +296,14 @@ app.post('/api/agent', async (req, res) => {
       }
     ];
 
-    // Call OpenAI with function calling
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `You are a helpful calendar management AI agent. You can help users create, view, update, and delete meetings.
+    // Get conversation history for this session
+    const history = getConversationHistory(session);
+
+    // Build messages array with system prompt, history, and current query
+    const messages = [
+      {
+        role: "system",
+        content: `You are a helpful calendar management AI agent. You can help users create, view, update, and delete meetings.
 
 When users ask about their calendar:
 - Parse dates and times from natural language (convert to ISO 8601 format)
@@ -234,14 +311,29 @@ When users ask about their calendar:
 - Extract meeting details from conversational requests
 - Use the provided functions to interact with the calendar system
 - Always confirm the action taken and provide relevant details
+- Use context from previous messages to understand references like "it", "that meeting", "the same time", etc.
+
+IMPORTANT - Conflict Handling:
+- When creating a meeting, if there's a time conflict, DO NOT create the meeting automatically
+- Instead, inform the user about the conflict and the conflicting meeting(s)
+- Ask the user to either:
+  1. Choose a different time
+  2. Confirm they want to proceed anyway (use forceCreate: true parameter)
+- Only create a conflicting meeting if the user explicitly confirms they want to proceed despite the conflict
 
 Current date/time context: ${new Date().toISOString()}`
-        },
-        {
-          role: "user",
-          content: query
-        }
-      ],
+      },
+      ...history,
+      {
+        role: "user",
+        content: query
+      }
+    ];
+
+    // Call OpenAI with function calling
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: messages,
       tools: tools,
       tool_choice: "auto"
     });
@@ -270,6 +362,30 @@ Current date/time context: ${new Date().toISOString()}`
           const conflicts = await checkTimeConflict(start, end);
           const hasConflict = conflicts.length > 0;
 
+          // If there's a conflict and user hasn't confirmed, don't create the meeting
+          if (hasConflict && !functionArgs.forceCreate) {
+            functionResult = {
+              success: false,
+              hasConflict: true,
+              requiresConfirmation: true,
+              message: 'Time conflict detected. Please choose a different time or confirm to create anyway.',
+              conflicts: conflicts.map(m => ({
+                id: m._id,
+                title: m.title,
+                startTime: m.startTime,
+                endTime: m.endTime
+              })),
+              proposedMeeting: {
+                title: functionArgs.title,
+                description: functionArgs.description,
+                startTime: start,
+                endTime: end
+              }
+            };
+            break;
+          }
+
+          // Create meeting if no conflict or user has confirmed
           const newMeeting = await Meeting.create({
             title: functionArgs.title,
             description: functionArgs.description,
@@ -358,14 +474,7 @@ Current date/time context: ${new Date().toISOString()}`
       const secondResponse = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [
-          {
-            role: "system",
-            content: `You are a helpful calendar management AI agent. Provide a clear, friendly response about what action was taken.`
-          },
-          {
-            role: "user",
-            content: query
-          },
+          ...messages,
           assistantMessage,
           {
             role: "tool",
@@ -377,19 +486,26 @@ Current date/time context: ${new Date().toISOString()}`
 
       const finalResponse = secondResponse.choices[0].message.content;
 
+      // Add to conversation history (including tool call and result)
+      addToHistory(session, query, assistantMessage, toolCall, functionResult);
+
       return res.status(200).json({
         success: true,
         response: finalResponse,
         action: functionName,
-        result: functionResult
+        result: functionResult,
+        sessionId: session
       });
 
     } else {
       // No function call - just return the assistant's message
+      addToHistory(session, query, assistantMessage);
+
       return res.status(200).json({
         success: true,
         response: assistantMessage.content,
-        action: 'none'
+        action: 'none',
+        sessionId: session
       });
     }
 
