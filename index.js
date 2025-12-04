@@ -69,7 +69,6 @@ app.get('/health', async (req, res) => {
 // Helper function to check for time conflicts
 const checkTimeConflict = async (startTime, endTime, excludeMeetingId = null) => {
   const query = {
-    status: 'scheduled',
     $or: [
       {
         // New meeting starts during existing meeting
@@ -139,22 +138,9 @@ app.post('/api/agent', async (req, res) => {
               endTime: {
                 type: "string",
                 description: "End time in ISO 8601 format (e.g., 2025-12-05T11:00:00Z)"
-              },
-              organizer: {
-                type: "string",
-                description: "Email of the meeting organizer"
-              },
-              attendees: {
-                type: "array",
-                items: { type: "string" },
-                description: "List of attendee emails"
-              },
-              location: {
-                type: "string",
-                description: "Meeting location (physical or virtual)"
               }
             },
-            required: ["title", "startTime", "endTime", "organizer"]
+            required: ["title", "startTime", "endTime"]
           }
         }
       },
@@ -162,19 +148,10 @@ app.post('/api/agent', async (req, res) => {
         type: "function",
         function: {
           name: "get_meetings",
-          description: "Retrieve meetings from the calendar. Can filter by organizer, status, or date range.",
+          description: "Retrieve meetings from the calendar. Can filter by date range.",
           parameters: {
             type: "object",
             properties: {
-              organizer: {
-                type: "string",
-                description: "Filter by organizer email"
-              },
-              status: {
-                type: "string",
-                enum: ["scheduled", "cancelled", "completed"],
-                description: "Filter by meeting status"
-              },
               startDate: {
                 type: "string",
                 description: "Filter meetings starting from this date (ISO 8601)"
@@ -218,20 +195,6 @@ app.post('/api/agent', async (req, res) => {
               endTime: {
                 type: "string",
                 description: "New end time in ISO 8601 format"
-              },
-              attendees: {
-                type: "array",
-                items: { type: "string" },
-                description: "Updated list of attendee emails"
-              },
-              location: {
-                type: "string",
-                description: "New location"
-              },
-              status: {
-                type: "string",
-                enum: ["scheduled", "cancelled", "completed"],
-                description: "New status"
               }
             },
             required: ["meetingId"]
@@ -312,13 +275,7 @@ Current date/time context: ${new Date().toISOString()}`
             description: functionArgs.description,
             startTime: start,
             endTime: end,
-            organizer: functionArgs.organizer,
-            attendees: functionArgs.attendees || [],
-            location: functionArgs.location,
-            hasConflict,
-            conflictDetails: hasConflict 
-              ? `Conflicts with ${conflicts.length} meeting(s): ${conflicts.map(m => m.title).join(', ')}`
-              : undefined
+            hasConflict
           });
 
           functionResult = {
@@ -336,8 +293,6 @@ Current date/time context: ${new Date().toISOString()}`
 
         case 'get_meetings':
           let query = {};
-          if (functionArgs.organizer) query.organizer = functionArgs.organizer;
-          if (functionArgs.status) query.status = functionArgs.status;
           if (functionArgs.startDate || functionArgs.endDate) {
             query.startTime = {};
             if (functionArgs.startDate) query.startTime.$gte = new Date(functionArgs.startDate);
@@ -365,9 +320,6 @@ Current date/time context: ${new Date().toISOString()}`
 
           if (functionArgs.title) meeting.title = functionArgs.title;
           if (functionArgs.description !== undefined) meeting.description = functionArgs.description;
-          if (functionArgs.attendees) meeting.attendees = functionArgs.attendees;
-          if (functionArgs.location !== undefined) meeting.location = functionArgs.location;
-          if (functionArgs.status) meeting.status = functionArgs.status;
 
           if (functionArgs.startTime || functionArgs.endTime) {
             const newStart = functionArgs.startTime ? new Date(functionArgs.startTime) : meeting.startTime;
@@ -382,9 +334,6 @@ Current date/time context: ${new Date().toISOString()}`
             meeting.startTime = newStart;
             meeting.endTime = newEnd;
             meeting.hasConflict = updateConflicts.length > 0;
-            meeting.conflictDetails = updateConflicts.length > 0
-              ? `Conflicts with ${updateConflicts.length} meeting(s)`
-              : undefined;
           }
 
           await meeting.save();
@@ -456,13 +405,13 @@ Current date/time context: ${new Date().toISOString()}`
 // 2. Create a new meeting
 app.post('/api/meetings', async (req, res) => {
   try {
-    const { title, description, startTime, endTime, organizer, attendees, location } = req.body;
+    const { title, description, startTime, endTime } = req.body;
 
     // Validation
-    if (!title || !startTime || !endTime || !organizer) {
+    if (!title || !startTime || !endTime) {
       return res.status(400).json({ 
         error: 'Missing required fields',
-        required: ['title', 'startTime', 'endTime', 'organizer']
+        required: ['title', 'startTime', 'endTime']
       });
     }
 
@@ -492,13 +441,6 @@ app.post('/api/meetings', async (req, res) => {
     const conflictingMeetings = await checkTimeConflict(start, end);
     
     const hasConflict = conflictingMeetings.length > 0;
-    let conflictDetails = '';
-
-    if (hasConflict) {
-      conflictDetails = `This meeting conflicts with ${conflictingMeetings.length} existing meeting(s): ${
-        conflictingMeetings.map(m => `"${m.title}" (${m.startTime.toLocaleString()} - ${m.endTime.toLocaleString()})`).join(', ')
-      }`;
-    }
 
     // Create the meeting regardless of conflict
     const newMeeting = await Meeting.create({
@@ -506,11 +448,7 @@ app.post('/api/meetings', async (req, res) => {
       description,
       startTime: start,
       endTime: end,
-      organizer,
-      attendees: attendees || [],
-      location,
-      hasConflict,
-      conflictDetails: hasConflict ? conflictDetails : undefined
+      hasConflict
     });
 
     // Prepare response
@@ -527,8 +465,7 @@ app.post('/api/meetings', async (req, res) => {
         id: m._id,
         title: m.title,
         startTime: m.startTime,
-        endTime: m.endTime,
-        organizer: m.organizer
+        endTime: m.endTime
       }));
     }
 
@@ -548,17 +485,9 @@ app.get('/api/meetings', async (req, res) => {
   try {
     await connectToDatabase();
     
-    const { organizer, status, startDate, endDate, limit = 50 } = req.query;
+    const { startDate, endDate, limit = 50 } = req.query;
     
     let query = {};
-    
-    if (organizer) {
-      query.organizer = organizer;
-    }
-    
-    if (status) {
-      query.status = status;
-    }
 
     // Date range filter
     if (startDate || endDate) {
@@ -618,7 +547,7 @@ app.put('/api/meetings/:id', async (req, res) => {
   try {
     await connectToDatabase();
     
-    const { title, description, startTime, endTime, organizer, attendees, location, status } = req.body;
+    const { title, description, startTime, endTime } = req.body;
     
     const meeting = await Meeting.findById(req.params.id);
     
@@ -629,10 +558,6 @@ app.put('/api/meetings/:id', async (req, res) => {
     // Update fields
     if (title) meeting.title = title;
     if (description !== undefined) meeting.description = description;
-    if (organizer) meeting.organizer = organizer;
-    if (attendees) meeting.attendees = attendees;
-    if (location !== undefined) meeting.location = location;
-    if (status) meeting.status = status;
 
     // If time is being updated, check for conflicts
     if (startTime || endTime) {
@@ -649,14 +574,6 @@ app.put('/api/meetings/:id', async (req, res) => {
       meeting.startTime = newStart;
       meeting.endTime = newEnd;
       meeting.hasConflict = hasConflict;
-      
-      if (hasConflict) {
-        meeting.conflictDetails = `This meeting conflicts with ${conflictingMeetings.length} existing meeting(s): ${
-          conflictingMeetings.map(m => `"${m.title}"`).join(', ')
-        }`;
-      } else {
-        meeting.conflictDetails = undefined;
-      }
     }
 
     await meeting.save();

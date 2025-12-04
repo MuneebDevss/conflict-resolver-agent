@@ -18,30 +18,9 @@ const MeetingSchema = new mongoose.Schema({
     type: Date,
     required: true
   },
-  organizer: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  attendees: [{
-    type: String,
-    trim: true
-  }],
-  location: {
-    type: String,
-    trim: true
-  },
-  status: {
-    type: String,
-    enum: ['scheduled', 'cancelled', 'completed'],
-    default: 'scheduled'
-  },
   hasConflict: {
     type: Boolean,
     default: false
-  },
-  conflictDetails: {
-    type: String
   }
 }, {
   timestamps: true
@@ -49,6 +28,5 @@ const MeetingSchema = new mongoose.Schema({
 
 // Index for faster queries
 MeetingSchema.index({ startTime: 1, endTime: 1 });
-MeetingSchema.index({ organizer: 1 });
 
 module.exports = mongoose.models.Meeting || mongoose.model('Meeting', MeetingSchema);
