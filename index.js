@@ -1,9 +1,8 @@
 const express = require('express');
 const dotenv = require('dotenv');
-const OpenAI = require('openai');
 const cors = require('cors');
 const connectToDatabase = require('./db');
-const Conflict = require('./models/conflict');
+const Meeting = require('./models/Meeting');
 
 dotenv.config();
 
@@ -15,11 +14,23 @@ app.use(express.json());
 
 // 1. Health Check Route
 app.get('/', (req, res) => {
-  res.send('Conflict Resolver API is running!');
+  res.send('Calendar Manager API is running! 📅');
 });
 
 app.get('/api', (req, res) => {
-  res.json({ status: 'ok', message: 'Conflict Resolver API' });
+  res.json({ 
+    status: 'ok', 
+    message: 'Calendar Manager API',
+    version: '1.0.0',
+    endpoints: {
+      health: '/health',
+      createMeeting: 'POST /api/meetings',
+      getMeetings: 'GET /api/meetings',
+      getMeetingById: 'GET /api/meetings/:id',
+      updateMeeting: 'PUT /api/meetings/:id',
+      deleteMeeting: 'DELETE /api/meetings/:id'
+    }
+  });
 });
 
 // Health Check with Database Status
@@ -30,15 +41,15 @@ app.get('/health', async (req, res) => {
     status: 'OK',
     environment: {
       nodeEnv: process.env.NODE_ENV || 'development',
-      hasOpenAIKey: !!process.env.OPENAI_API_KEY,
       hasMongoURI: !!process.env.MONGO_URI
     }
   };
 
   try {
-    // Check database connection
     await connectToDatabase();
     healthCheck.database = 'connected';
+    const meetingCount = await Meeting.countDocuments();
+    healthCheck.totalMeetings = meetingCount;
     res.status(200).json(healthCheck);
   } catch (error) {
     healthCheck.database = 'disconnected';
@@ -47,61 +58,110 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// 2. The Resolution Route
-app.post('/api/resolve', async (req, res) => {
-  try {
-    const { message } = req.body;
+// Helper function to check for time conflicts
+const checkTimeConflict = async (startTime, endTime, excludeMeetingId = null) => {
+  const query = {
+    status: 'scheduled',
+    $or: [
+      {
+        // New meeting starts during existing meeting
+        startTime: { $lt: endTime },
+        endTime: { $gt: startTime }
+      }
+    ]
+  };
 
-    if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
+  if (excludeMeetingId) {
+    query._id = { $ne: excludeMeetingId };
+  }
+
+  const conflictingMeetings = await Meeting.find(query);
+  return conflictingMeetings;
+};
+
+// 2. Create a new meeting
+app.post('/api/meetings', async (req, res) => {
+  try {
+    const { title, description, startTime, endTime, organizer, attendees, location } = req.body;
+
+    // Validation
+    if (!title || !startTime || !endTime || !organizer) {
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        required: ['title', 'startTime', 'endTime', 'organizer']
+      });
     }
 
     // Validate environment variables
-    if (!process.env.OPENAI_API_KEY) {
-      console.error('Missing OPENAI_API_KEY');
-      return res.status(500).json({ error: 'Server configuration error: Missing OpenAI API key' });
-    }
     if (!process.env.MONGO_URI) {
       console.error('Missing MONGO_URI');
       return res.status(500).json({ error: 'Server configuration error: Missing MongoDB URI' });
     }
 
-    // Initialize OpenAI client per request (safer for serverless)
-    const openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
-
     // Connect to DB
     await connectToDatabase();
 
-    // Call OpenAI
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { 
-          role: "system", 
-          content: "You are an empathetic, expert conflict mediator. Read the user's conflict scenario. Provide a calm, objective analysis and 3 actionable steps to resolve the conflict using 'Non-Violent Communication' techniques." 
-        },
-        { role: "user", content: message },
-      ],
+    // Parse dates
+    const start = new Date(startTime);
+    const end = new Date(endTime);
+
+    // Validate times
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format for startTime or endTime' });
+    }
+
+    if (end <= start) {
+      return res.status(400).json({ error: 'endTime must be after startTime' });
+    }
+
+    // Check for conflicts
+    const conflictingMeetings = await checkTimeConflict(start, end);
+    
+    const hasConflict = conflictingMeetings.length > 0;
+    let conflictDetails = '';
+
+    if (hasConflict) {
+      conflictDetails = `This meeting conflicts with ${conflictingMeetings.length} existing meeting(s): ${
+        conflictingMeetings.map(m => `"${m.title}" (${m.startTime.toLocaleString()} - ${m.endTime.toLocaleString()})`).join(', ')
+      }`;
+    }
+
+    // Create the meeting regardless of conflict
+    const newMeeting = await Meeting.create({
+      title,
+      description,
+      startTime: start,
+      endTime: end,
+      organizer,
+      attendees: attendees || [],
+      location,
+      hasConflict,
+      conflictDetails: hasConflict ? conflictDetails : undefined
     });
 
-    const aiResponse = completion.choices[0].message.content;
-
-    // Save to MongoDB
-    const newRecord = await Conflict.create({
-      scenario: message,
-      resolution: aiResponse
-    });
-
-    // Return response
-    res.status(200).json({
+    // Prepare response
+    const response = {
       success: true,
-      data: newRecord
-    });
+      message: hasConflict 
+        ? '⚠️ Meeting created successfully, but conflicts detected with existing meetings'
+        : '✅ Meeting created successfully',
+      data: newMeeting
+    };
+
+    if (hasConflict) {
+      response.conflicts = conflictingMeetings.map(m => ({
+        id: m._id,
+        title: m.title,
+        startTime: m.startTime,
+        endTime: m.endTime,
+        organizer: m.organizer
+      }));
+    }
+
+    res.status(201).json(response);
 
   } catch (error) {
-    console.error('Error in /api/resolve:', error.message);
+    console.error('Error creating meeting:', error.message);
     res.status(500).json({ 
       error: 'Internal Server Error',
       message: error.message 
@@ -109,10 +169,167 @@ app.post('/api/resolve', async (req, res) => {
   }
 });
 
-// Start server (for Render and local development)
+// 3. Get all meetings
+app.get('/api/meetings', async (req, res) => {
+  try {
+    await connectToDatabase();
+    
+    const { organizer, status, startDate, endDate, limit = 50 } = req.query;
+    
+    let query = {};
+    
+    if (organizer) {
+      query.organizer = organizer;
+    }
+    
+    if (status) {
+      query.status = status;
+    }
+
+    // Date range filter
+    if (startDate || endDate) {
+      query.startTime = {};
+      if (startDate) {
+        query.startTime.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        query.startTime.$lte = new Date(endDate);
+      }
+    }
+
+    const meetings = await Meeting.find(query)
+      .sort({ startTime: 1 })
+      .limit(parseInt(limit));
+
+    res.status(200).json({
+      success: true,
+      count: meetings.length,
+      data: meetings
+    });
+  } catch (error) {
+    console.error('Error fetching meetings:', error.message);
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: error.message 
+    });
+  }
+});
+
+// 4. Get a single meeting by ID
+app.get('/api/meetings/:id', async (req, res) => {
+  try {
+    await connectToDatabase();
+    
+    const meeting = await Meeting.findById(req.params.id);
+    
+    if (!meeting) {
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: meeting
+    });
+  } catch (error) {
+    console.error('Error fetching meeting:', error.message);
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: error.message 
+    });
+  }
+});
+
+// 5. Update a meeting
+app.put('/api/meetings/:id', async (req, res) => {
+  try {
+    await connectToDatabase();
+    
+    const { title, description, startTime, endTime, organizer, attendees, location, status } = req.body;
+    
+    const meeting = await Meeting.findById(req.params.id);
+    
+    if (!meeting) {
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+
+    // Update fields
+    if (title) meeting.title = title;
+    if (description !== undefined) meeting.description = description;
+    if (organizer) meeting.organizer = organizer;
+    if (attendees) meeting.attendees = attendees;
+    if (location !== undefined) meeting.location = location;
+    if (status) meeting.status = status;
+
+    // If time is being updated, check for conflicts
+    if (startTime || endTime) {
+      const newStart = startTime ? new Date(startTime) : meeting.startTime;
+      const newEnd = endTime ? new Date(endTime) : meeting.endTime;
+
+      if (newEnd <= newStart) {
+        return res.status(400).json({ error: 'endTime must be after startTime' });
+      }
+
+      const conflictingMeetings = await checkTimeConflict(newStart, newEnd, meeting._id);
+      const hasConflict = conflictingMeetings.length > 0;
+
+      meeting.startTime = newStart;
+      meeting.endTime = newEnd;
+      meeting.hasConflict = hasConflict;
+      
+      if (hasConflict) {
+        meeting.conflictDetails = `This meeting conflicts with ${conflictingMeetings.length} existing meeting(s): ${
+          conflictingMeetings.map(m => `"${m.title}"`).join(', ')
+        }`;
+      } else {
+        meeting.conflictDetails = undefined;
+      }
+    }
+
+    await meeting.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Meeting updated successfully',
+      data: meeting
+    });
+  } catch (error) {
+    console.error('Error updating meeting:', error.message);
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: error.message 
+    });
+  }
+});
+
+// 6. Delete a meeting
+app.delete('/api/meetings/:id', async (req, res) => {
+  try {
+    await connectToDatabase();
+    
+    const meeting = await Meeting.findByIdAndDelete(req.params.id);
+    
+    if (!meeting) {
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Meeting deleted successfully',
+      data: meeting
+    });
+  } catch (error) {
+    console.error('Error deleting meeting:', error.message);
+    res.status(500).json({ 
+      error: 'Internal Server Error',
+      message: error.message 
+    });
+  }
+});
+
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Calendar Manager API running on port ${PORT}`);
 });
 
 module.exports = app;
