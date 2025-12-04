@@ -155,6 +155,440 @@ const checkTimeConflict = async (startTime, endTime, excludeMeetingId = null) =>
   return conflictingMeetings;
 };
 
+// Supervisor-compatible endpoint - accepts AgentRequest format
+app.post('/api/supervisor/handle', async (req, res) => {
+  try {
+    const { request_id, agent_name, intent, input, context } = req.body;
+
+    // Validate required fields from AgentRequest
+    if (!input || !input.text) {
+      return res.status(400).json({
+        request_id: request_id || 'unknown',
+        agent_name: agent_name || 'calendar_manager_agent',
+        status: 'error',
+        error: {
+          type: 'validation_error',
+          message: 'input.text is required'
+        }
+      });
+    }
+
+    const query = input.text;
+    const sessionId = context?.session_id || context?.user_id || 'supervisor_session';
+
+    // Validate environment variables
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(500).json({
+        request_id: request_id || 'unknown',
+        agent_name: agent_name || 'calendar_manager_agent',
+        status: 'error',
+        error: {
+          type: 'config_error',
+          message: 'Missing OpenAI API key'
+        }
+      });
+    }
+    if (!process.env.MONGO_URI) {
+      return res.status(500).json({
+        request_id: request_id || 'unknown',
+        agent_name: agent_name || 'calendar_manager_agent',
+        status: 'error',
+        error: {
+          type: 'config_error',
+          message: 'Missing MongoDB URI'
+        }
+      });
+    }
+
+    // Initialize OpenAI client
+    const openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY,
+    });
+
+    // Connect to DB
+    await connectToDatabase();
+
+    // Define available tools for the agent
+    const tools = [
+      {
+        type: "function",
+        function: {
+          name: "create_meeting",
+          description: "Create a new meeting in the calendar. Automatically checks for conflicts with existing meetings.",
+          parameters: {
+            type: "object",
+            properties: {
+              title: {
+                type: "string",
+                description: "The title/name of the meeting"
+              },
+              description: {
+                type: "string",
+                description: "Detailed description of the meeting"
+              },
+              startTime: {
+                type: "string",
+                description: "Start time in ISO 8601 format (e.g., 2025-12-05T10:00:00Z)"
+              },
+              endTime: {
+                type: "string",
+                description: "End time in ISO 8601 format (e.g., 2025-12-05T11:00:00Z)"
+              },
+              forceCreate: {
+                type: "boolean",
+                description: "Set to true to create meeting even if there's a conflict (only after user confirms)"
+              }
+            },
+            required: ["title", "startTime", "endTime"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "get_meetings",
+          description: "Retrieve meetings from the calendar. Can filter by date range.",
+          parameters: {
+            type: "object",
+            properties: {
+              startDate: {
+                type: "string",
+                description: "Filter meetings starting from this date (ISO 8601)"
+              },
+              endDate: {
+                type: "string",
+                description: "Filter meetings up to this date (ISO 8601)"
+              },
+              limit: {
+                type: "number",
+                description: "Maximum number of meetings to return (default 50)"
+              }
+            }
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "update_meeting",
+          description: "Update an existing meeting. Can modify title, times, attendees, location, or status.",
+          parameters: {
+            type: "object",
+            properties: {
+              meetingId: {
+                type: "string",
+                description: "The ID of the meeting to update"
+              },
+              title: {
+                type: "string",
+                description: "New title for the meeting"
+              },
+              description: {
+                type: "string",
+                description: "New description"
+              },
+              startTime: {
+                type: "string",
+                description: "New start time in ISO 8601 format"
+              },
+              endTime: {
+                type: "string",
+                description: "New end time in ISO 8601 format"
+              }
+            },
+            required: ["meetingId"]
+          }
+        }
+      },
+      {
+        type: "function",
+        function: {
+          name: "delete_meeting",
+          description: "Delete a meeting from the calendar.",
+          parameters: {
+            type: "object",
+            properties: {
+              meetingId: {
+                type: "string",
+                description: "The ID of the meeting to delete"
+              }
+            },
+            required: ["meetingId"]
+          }
+        }
+      }
+    ];
+
+    // Get conversation history for this session
+    const history = getConversationHistory(sessionId);
+
+    // Build messages array with system prompt, history, and current query
+    const messages = [
+      {
+        role: "system",
+        content: `You are a helpful calendar management AI agent. You can help users create, view, update, and delete meetings.
+
+When users ask about their calendar:
+- Parse dates and times from natural language (convert to ISO 8601 format)
+- Understand relative times (e.g., "tomorrow at 2pm", "next Monday")
+- Extract meeting details from conversational requests
+- Use the provided functions to interact with the calendar system
+- Always confirm the action taken and provide relevant details
+- Use context from previous messages to understand references like "it", "that meeting", "the same time", etc.
+
+IMPORTANT - Conflict Handling:
+- When creating a meeting, if there's a time conflict, DO NOT create the meeting automatically
+- Instead, inform the user about the conflict and the conflicting meeting(s)
+- Ask the user to either:
+  1. Choose a different time
+  2. Confirm they want to proceed anyway (use forceCreate: true parameter)
+- Only create a conflicting meeting if the user explicitly confirms they want to proceed despite the conflict
+
+Current date/time context: ${new Date().toISOString()}`
+      },
+      ...history,
+      {
+        role: "user",
+        content: query
+      }
+    ];
+
+    // Call OpenAI with function calling
+    const response = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: messages,
+      tools: tools,
+      tool_choice: "auto"
+    });
+
+    const assistantMessage = response.choices[0].message;
+
+    // Check if the model wants to call a function
+    if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      const toolCall = assistantMessage.tool_calls[0];
+      const functionName = toolCall.function.name;
+      const functionArgs = JSON.parse(toolCall.function.arguments);
+
+      let functionResult;
+
+      // Execute the appropriate function
+      switch (functionName) {
+        case 'create_meeting':
+          const startTime = new Date(functionArgs.startTime);
+          const endTime = new Date(functionArgs.endTime);
+          
+          // Check for conflicts
+          const conflicts = await checkTimeConflict(startTime, endTime);
+          
+          if (conflicts.length > 0 && !functionArgs.forceCreate) {
+            // Return conflict warning without creating
+            functionResult = {
+              success: false,
+              hasConflict: true,
+              message: '⚠️ Time conflict detected! The requested time overlaps with existing meeting(s).',
+              conflictingMeetings: conflicts.map(m => ({
+                id: m._id,
+                title: m.title,
+                startTime: m.startTime,
+                endTime: m.endTime
+              })),
+              suggestion: 'Would you like to schedule at a different time, or proceed anyway?'
+            };
+          } else {
+            // No conflict or forceCreate is true
+            const newMeeting = await Meeting.create({
+              title: functionArgs.title,
+              description: functionArgs.description || '',
+              startTime: startTime,
+              endTime: endTime,
+              hasConflict: conflicts.length > 0
+            });
+            
+            functionResult = {
+              success: true,
+              message: conflicts.length > 0 
+                ? '✅ Meeting created (conflict override confirmed)'
+                : '✅ Meeting created successfully',
+              meeting: {
+                id: newMeeting._id,
+                title: newMeeting.title,
+                description: newMeeting.description,
+                startTime: newMeeting.startTime,
+                endTime: newMeeting.endTime
+              }
+            };
+          }
+          break;
+
+        case 'get_meetings':
+          let query = {};
+          if (functionArgs.startDate || functionArgs.endDate) {
+            query.startTime = {};
+            if (functionArgs.startDate) {
+              query.startTime.$gte = new Date(functionArgs.startDate);
+            }
+            if (functionArgs.endDate) {
+              query.startTime.$lte = new Date(functionArgs.endDate);
+            }
+          }
+          
+          const meetings = await Meeting.find(query)
+            .sort({ startTime: 1 })
+            .limit(functionArgs.limit || 50);
+          
+          functionResult = {
+            success: true,
+            count: meetings.length,
+            meetings: meetings.map(m => ({
+              id: m._id,
+              title: m.title,
+              description: m.description,
+              startTime: m.startTime,
+              endTime: m.endTime,
+              hasConflict: m.hasConflict
+            }))
+          };
+          break;
+
+        case 'update_meeting':
+          const meetingToUpdate = await Meeting.findById(functionArgs.meetingId);
+          
+          if (!meetingToUpdate) {
+            functionResult = {
+              success: false,
+              message: '❌ Meeting not found'
+            };
+          } else {
+            if (functionArgs.title) meetingToUpdate.title = functionArgs.title;
+            if (functionArgs.description !== undefined) meetingToUpdate.description = functionArgs.description;
+            
+            if (functionArgs.startTime || functionArgs.endTime) {
+              const newStart = functionArgs.startTime ? new Date(functionArgs.startTime) : meetingToUpdate.startTime;
+              const newEnd = functionArgs.endTime ? new Date(functionArgs.endTime) : meetingToUpdate.endTime;
+              
+              const conflicts = await checkTimeConflict(newStart, newEnd, meetingToUpdate._id);
+              
+              meetingToUpdate.startTime = newStart;
+              meetingToUpdate.endTime = newEnd;
+              meetingToUpdate.hasConflict = conflicts.length > 0;
+            }
+            
+            await meetingToUpdate.save();
+            
+            functionResult = {
+              success: true,
+              message: '✅ Meeting updated successfully',
+              meeting: {
+                id: meetingToUpdate._id,
+                title: meetingToUpdate.title,
+                description: meetingToUpdate.description,
+                startTime: meetingToUpdate.startTime,
+                endTime: meetingToUpdate.endTime
+              }
+            };
+          }
+          break;
+
+        case 'delete_meeting':
+          const deletedMeeting = await Meeting.findByIdAndDelete(functionArgs.meetingId);
+          
+          if (!deletedMeeting) {
+            functionResult = {
+              success: false,
+              message: '❌ Meeting not found'
+            };
+          } else {
+            functionResult = {
+              success: true,
+              message: '✅ Meeting deleted successfully',
+              deletedMeeting: {
+                id: deletedMeeting._id,
+                title: deletedMeeting.title
+              }
+            };
+          }
+          break;
+
+        default:
+          functionResult = {
+            success: false,
+            message: `Unknown function: ${functionName}`
+          };
+      }
+
+      // Add to conversation history
+      addToHistory(sessionId, query, assistantMessage, toolCall, functionResult);
+
+      // Get final response with function result
+      const finalMessages = [
+        {
+          role: "system",
+          content: `You are a helpful calendar management AI agent. Provide clear, concise responses about calendar operations.`
+        },
+        ...history,
+        {
+          role: "user",
+          content: query
+        },
+        {
+          role: "assistant",
+          content: assistantMessage.content || null,
+          tool_calls: assistantMessage.tool_calls
+        },
+        {
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(functionResult)
+        }
+      ];
+
+      const finalResponse = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: finalMessages
+      });
+
+      const finalAnswer = finalResponse.choices[0].message.content;
+
+      // Return in AgentResponse format
+      return res.status(200).json({
+        request_id: request_id,
+        agent_name: agent_name || 'calendar_manager_agent',
+        status: 'success',
+        output: {
+          result: finalAnswer,
+          data: functionResult
+        }
+      });
+
+    } else {
+      // No tool call, just return the assistant's message
+      addToHistory(sessionId, query, assistantMessage);
+
+      // Return in AgentResponse format
+      return res.status(200).json({
+        request_id: request_id,
+        agent_name: agent_name || 'calendar_manager_agent',
+        status: 'success',
+        output: {
+          result: assistantMessage.content
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Error in supervisor handler:', error.message);
+    return res.status(500).json({
+      request_id: req.body.request_id || 'unknown',
+      agent_name: req.body.agent_name || 'calendar_manager_agent',
+      status: 'error',
+      error: {
+        type: 'internal_error',
+        message: error.message
+      }
+    });
+  }
+});
+
 // AI Agent Endpoint - Main entry point for natural language queries
 app.post('/api/agent', async (req, res) => {
   try {
